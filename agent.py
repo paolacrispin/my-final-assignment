@@ -27,6 +27,7 @@ from bootcamp_agent.documents import Document, load_corpus
 from bootcamp_agent.llm import LLMClient, get_client
 from bootcamp_agent.schema import ResearchAnswer
 from bootcamp_agent.tools import Tool, build_tools
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 class StrictCitationClient:
     """Adds stricter citation discipline without changing the provider."""
 
@@ -119,20 +120,72 @@ class YourAgent:
                     return matches
 
         return self.documents
+
+    def _retrieved_content_has_injection(self, documents: list[Document]) -> bool:
+        """Detect standalone instruction-shaped text inside retrieved documents."""
+        suspicious_starts = (
+            "ignore previous instructions",
+            "ignore all previous instructions",
+            "disregard previous instructions",
+            "override previous instructions",
+        )
+
+        for doc in documents:
+            for line in doc.text.splitlines():
+                normalized = line.strip().lower()
+                if normalized.startswith(suspicious_starts):
+                    return True
+
+        return False  
         
     def run(self, question: str) -> AgentResult:
         """One question, answered or refused, with the trace of how."""
         selected_documents = self._select_documents(question)
 
-        result = answer_question(
-            question,
-            selected_documents,
-            self.client,
-            max_tool_calls=3,
-            top_k=5,
-        )
+        executor = ThreadPoolExecutor(max_workers=1)
+
+        try:
+            future = executor.submit(
+                answer_question,
+                question,
+                selected_documents,
+                self.client,
+                3,
+                5,
+            )
+
+            result = future.result(timeout=self.timeout_s)
+
+        except FuturesTimeoutError:
+            answer = ResearchAnswer(
+                answer="I don't know based on the provided corpus.",
+                citations=(),
+                confidence=0.0,
+                needs_human_review=True,
+            )
+            return AgentResult(answer=answer, trace=())
+
+        except Exception:
+            answer = ResearchAnswer(
+                answer="I don't know based on the provided corpus.",
+                citations=(),
+                confidence=0.0,
+                needs_human_review=True,
+            )
+            return AgentResult(answer=answer, trace=())
+
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
         answer = result.answer
+        if self._retrieved_content_has_injection(selected_documents):
+            answer = ResearchAnswer(
+                answer=answer.answer,
+                citations=answer.citations,
+                confidence=min(answer.confidence, 0.2),
+                needs_human_review=True,
+            )
+            return AgentResult(answer=answer, trace=result.trace)
 
         if (
             answer.needs_human_review
